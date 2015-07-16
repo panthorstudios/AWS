@@ -3,46 +3,130 @@ var aws = require('aws-sdk');
 var parseString = require('xml2js').parseString;
 var request = require('request');
 
-var pagerDutyURL="https://events.pagerduty.com/generic/2010-04-15/create_event.json";
-var pagerDutyKey="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+// PagerDuty
+ var pagerDutyURL="https://events.pagerduty.com/generic/2010-04-15/create_event.json";
+var pagerDutyKey="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+var pagerDutyEventType = "trigger";
+var pagerDutyDescription = "Alert";
 
-var ddb = new aws.DynamoDB({params: {TableName: 'LogstashOutputDev'}});
+// SNS output
+var snsOutputARN='arn:aws:sns:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+var accessKey = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+var secretKey = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
 
-var stringConverter=function(sourceObj,defaultStr) {
-  if (sourceObj && sourceObj.length>0  && !!sourceObj[0]) {
-    return sourceObj[0];
+// This function will get the text from the first text node 
+//   of an xml element, returning a default string if any errors 
+var stringConverter=function(element,defaultStr) {
+  defaultStr = defaultStr || "n/a";
+  if (element && element.length>0  && !!element[0]) {
+    return element[0];
   } else {
     return defaultStr;
   }
 }
 
-exports.handler = function(event, context) {
+// DynamoDB
+var dynamoTable='dynamo-table'
+var ddb = new aws.DynamoDB({params: {TableName: dynamoTable}});
 
+function insertIntoDatabase(msgDetails,callback) {
+    console.log("Inserting into database...");
+    var itemParams = {
+        TableName: dynamoTable,
+        Item: {
+          SnsTopicArn:       {S: msgDetails.sns.topic_arn},
+          SnsPublishTime:    {S: msgDetails.sns.publish_time},
+          SnsMessageId:      {S: msgDetails.sns.message_id},
+          LambdaReceiveTime: {S: msgDetails.sns.lambda_receive_time},
 
-  var AppName="n/a";
-  var CompName="n/a";
-  var MachineName="n/a";
-  var Severity="n/a";
+          MachineName:     {S: msgDetails.machine_name},
+          ApplicationName: {S: msgDetails.app_name},
+          ComponentName:   {S: msgDetails.component_name},
+          Severity:        {S: msgDetails.severity},
 
-  var AppErrorCode="-101";
-  var AppErrorDescr="n/a";
-  var AppErrorStr="n/a";
+          ApplicationErrorCode:        {S: msgDetails.app.error_code},
+          ApplicationErrorDescription: {S: msgDetails.app.error_descr},
+          ApplicationErrorString:      {S: msgDetails.app.error_string},
 
-  var SysErrorCode="n/a";
-  var SysErrorDescr="n/a";
-  var SysErrorStr="n/a";
+          SystemErrorCode:        {S: msgDetails.system.error_code},
+          SystemErrorDescription: {S: msgDetails.system.error_descr},
+          SystemErrorString:      {S: msgDetails.system.error_string},
+        }
+    }
+    ddb.putItem(itemParams, function() {
+        return sendPagerdutyAlert(msgDetails,callback);
+    });
+}
 
-  var SnsMessageId = event.Records[0].Sns.MessageId;
-  var SnsPublishTime = event.Records[0].Sns.Timestamp;
-  var SnsTopicArn = event.Records[0].Sns.TopicArn;
-  var LambdaReceiveTime = new Date().toString();
+function sendSNSMessage(subject,message,callback) {
+    aws.config.region = 'xxxxxxxxxxxxxxxxxxxxxxxxx';
+    var sns = new aws.SNS({ accessKeyId: accessKey, secretAccessKey:secretKey});
+    sns.publish(
+    {
+      Subject:  subject,
+      Message:  message,
+      TopicArn: snsOutputARN
+    },
+    function(err, data) {
+      if (err) {
+        console.log(err.stack);
+      }
+      callback();
+    }
+    );
+}
 
-  parseSnsMessage(function() {
-    context.done(null,'');
-  });
+function sendPagerdutyAlert(msgDetails,callback) {
+    console.log("Sending pagerduty alert if necessary...");
+    if (msgDetails.severity.toUpperCase() == "ERROR") {
+      var details = "Error: " + msgDetails.app.error_descr;
+      var options = {
+        uri: pagerDutyURL,
+        method: 'POST',
+        json: {"event_type": pagerDutyEventType, "service_key": pagerDutyKey,
+           "description": pagerDutyDescription, "details": details}
+      };
+      request(options, function(error, response, body){
+          if (!error && response.statusCode == 200) {
+            return callback();
+          }
 
-  function parseSnsMessage(callback) {
+          return sendSNSMessage('Error contacting PagerDuty',JSON.stringify(response),callback);
+
+      });
+    } else {
+      return callback()
+    }
+}
+
+function parseSnsMessage(event,callback) {
     console.log("Parsing SNS message...");
+
+// All message params must have a value or 
+// DB insert will fail
+
+    var msgDetails = {
+      app_name       : "n/a",
+      component_name : "n/a",
+      machine_name   : "n/a",
+      severity       : "n/a",
+      app : {
+        error_code   : "n/a",
+        error_descr  : "n/a",
+        error_string : "n/a",
+      },
+      system: {
+        error_code   : "n/a",
+        error_descr  : "n/a",
+        error_string : "n/a",
+      },
+      sns: {
+        message_id   : event.Records[0].Sns.MessageId,
+        publish_time : event.Records[0].Sns.Timestamp,
+        topic_arn    : event.Records[0].Sns.TopicArn,
+        lambda_receive_time : new Date().toString(),
+      }
+    }
 
     var MessageObj = JSON.parse(event.Records[0].Sns.Message);
     if (MessageObj && MessageObj.message) {
@@ -54,85 +138,44 @@ exports.handler = function(event, context) {
           errMsg=result.ErrorMessage;
 
           if (errMsg) {
-            AppName=stringConverter(errMsg.ApplicationName,"n/a");
-            CompName=stringConverter(errMsg.ComponentName,"n/a");
-            MachineName=stringConverter(errMsg.MachineName,"n/a");
+            msgDetails.app_name=stringConverter(errMsg.ApplicationName);
+            msgDetails.component_name=stringConverter(errMsg.ComponentName);
+            msgDetails.machine_name=stringConverter(errMsg.MachineName);
+
 // Should check for valid Severity values
-            Severity=stringConverter(errMsg.Severity,"n/a");
+            msgDetails.severity=stringConverter(errMsg.Severity);
 
-            AppErrorCode=stringConverter(errMsg.ApplicationErrorCode,"-101");
-            AppErrorDescr=stringConverter(errMsg.ApplicationErrorDescription,"n/a");
-            AppErrorStr=stringConverter(errMsg.ApplicationErrorString,"n/a");
+            msgDetails.app.error_code=stringConverter(errMsg.ApplicationErrorCode);
+            msgDetails.app.error_descr=stringConverter(errMsg.ApplicationErrorDescription);
+            msgDetails.app.error_string=stringConverter(errMsg.ApplicationErrorString);
 
-            SysErrorCode=stringConverter(errMsg.SystemErrorCode,"n/a");
-            SysErrorDescr=stringConverter(errMsg.SystemErrorDescription,"n/a");
-            SysErrorStr=stringConverter(errMsg.SystemErrorString,"n/a");
+            msgDetails.system.error_code=stringConverter(errMsg.SystemErrorCode);
+            msgDetails.system.error_descr=stringConverter(errMsg.SystemErrorDescription);
+            msgDetails.system.error_string=stringConverter(errMsg.SystemErrorString);
           } else {
-            Severity="Error";
-            AppErrorDescr="XML in message did not have ErrorMessage element";
-            AppErrorStr=xml;
+            msgDetails.severity="Error";
+            msgDetails.app.error_descr="XML in message did not have ErrorMessage element";
+            msgDetails.app.error_string=xml;
           }
         } else {
-          Severity="Error";
-          AppErrorDescr="Could not parse XML in message";
-          AppErrorStr=xml;
+          msgDetails.severity="Error";
+          msgDetails.app.error_descr="Could not parse XML in message";
+          msgDetails.app.error_string=xml;
         }
-        insertIntoDatabase(callback);
+        return insertIntoDatabase(msgDetails,callback);
       });
     } else {
-      Severity="Error";
-      AppErrorDescr="SNS message could not be parsed or did not have message element";
-      AppErrorStr=event.Records[0].Sns.Message;
-      insertIntoDatabase(callback);
+      msgDetails.severity="Error";
+      msgDetails.app.error_descr="SNS message could not be parsed or did not have message element";
+      msgDetails.app.error_string=event.Records[0].Sns.Message;
+      return insertIntoDatabase(msgDetails,callback);
     }
-  }
-
-  function insertIntoDatabase(callback) {
-    console.log("Inserting into database...");
-    var itemParams = {
-        TableName: "LogstashOutputDev",
-        Item: {
-          SnsTopicArn: {S: SnsTopicArn},
-          SnsPublishTime: {S: SnsPublishTime},
-          SnsMessageId: {S: SnsMessageId},
-          LambdaReceiveTime: {S: LambdaReceiveTime},
-          MachineName: {S: MachineName},
-          ApplicationName: {S: AppName},
-          ComponentName: {S: CompName},
-          Severity: {S: Severity},
-          ApplicationErrorCode: {S: AppErrorCode},
-          ApplicationErrorDescription: {S: AppErrorDescr},
-          ApplicationErrorString: {S: AppErrorStr},
-          SystemErrorCode: {S: SysErrorCode},
-          SystemErrorDescription: {S: SysErrorDescr},
-          SystemErrorString: {S: SysErrorStr},
-        }
-    }
-//    console.log("itemParams: " + JSON.stringify(itemParams));
-    ddb.putItem(itemParams, function() {
-        sendPagerdutyAlert(callback);
-    });
-  }
+}
 
 
-  function sendPagerdutyAlert(callback) {
-    console.log("Sending pagerduty alert if necessary...");
-    if (Severity.toUpperCase() == "ERROR") {
-      var descr = "DFC Alert (DEV)";
-      var details = "Error: " + AppErrorDescr;
-      var options = {
-        uri: pagerDutyURL,
-        method: 'POST',
-        json: {"event_type": "trigger", "service_key": pagerDutyKey,
-           "description": descr, "details": details}
-      };
-      request(options, function(error, response, body){
-          callback();
-      });
-    } else {
-      callback()
-    }
-  }
-
+exports.handler = function(event, context) {
+  parseSnsMessage(event,function() {
+    context.done(null,'');
+  });
 };
 
